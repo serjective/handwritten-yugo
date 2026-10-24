@@ -1,0 +1,1091 @@
+mport core
+import math
+import test
+// ---- TENSORS ----
+enum TensorError: core.Equatable, core.Format {
+    case invalid_dimension
+    case shape_overflow
+    case allocation_failed
+    case rank_mismatch
+    case index_out_of_bounds
+    case data_length_mismatch
+    case shape_mismatch
+    case empty_reduction
+    case invalid_learning_rate
+    case non_finite_logits
+}
+
+// An empty shape describes one scalar; any zero-sized axis makes the tensor empty.
+func shape_numel(_ dimensions: ReadSpan<Int>) -> Result<Int, TensorError> {
+    var saw_zero: Bool = false
+    // Validate every axis before returning zero or multiplying dimensions.
+    for dimension in dimensions {
+        if dimension < 0 {
+            return .err(TensorError.invalid_dimension)
+        }
+        if dimension == 0 {
+            saw_zero = true
+        }
+    }
+    if saw_zero {
+        return .ok(0)
+    }
+    var count: Int = 1
+    // O(2n) is still O(n)
+    for dimension in dimensions {
+        guard let product = core.checked_multiply(count, dimension) else {
+            return .err(TensorError.shape_overflow)
+        }
+        count = product
+    }
+    return .ok(count)
+}
+func shape_strides(_ dimensions: ReadSpan<Int>) -> Result<core.Buffer<Int>, TensorError> {
+    let sizes = shape_numel(dimensions)? // ret early if dimensions dont make sense
+    guard var buff = core.try_buffer<Int>(capacity: dimensions.count, allocator: core.system_allocator()) else {
+        return .err(TensorError.allocation_failed)
+    }
+    for _ in 0..<dimensions.count {
+        buff.append(0)
+    }
+    if sizes == 0 || dimensions.count == 0 {
+        return .ok(consume buff);
+    }
+    // let rstride = 1
+    buff[dimensions.count - 1] = 1
+    for i in (0..<dimensions.count-1).reversed() {
+        guard let product = core.checked_multiply(buff[i+1], dimensions[i+1]) else {
+            return .err(TensorError.shape_overflow)
+        }
+        buff[i] = product
+    }
+    return .ok(consume buff)
+}
+// typealias TensorResult<T> = Result<T, TensorError>
+
+struct Tensor {
+    private var values_: core.Buffer<f64>
+    private let shape_: core.Buffer<Int>
+    private let strides_: core.Buffer<Int>
+
+    static func scalar(value: f64) -> Result<Tensor, TensorError> {
+        let dimensions: [Int; 0] = []
+        return Tensor.full(dimensions[0...], value: value)
+    }
+
+    static func full(_ dimensions: ReadSpan<Int>, value: f64) -> Result<Tensor, TensorError> {
+        let elem_count = shape_numel(dimensions)?
+        let stride_arr = shape_strides(dimensions)?
+        guard var shape = core.try_buffer<Int>(capacity: dimensions.count, allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        guard var values = core.try_buffer<f64>(capacity: elem_count, allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        for z in dimensions {
+            shape.append(z)
+        }
+        for _ in 0..<elem_count {
+            values.append(value)
+        }
+        return .ok(Tensor(values_: consume values,
+            shape_: consume shape, strides_: consume stride_arr))
+    }
+    static func randn(_ dimensions: ReadSpan<Int>, rng: inout RNG) -> Result<Tensor, TensorError> {
+        var output = Tensor.full(dimensions, value: 0.0)?
+        for index in 0..<output.numel() {
+            output.values_[index] = rng.normal()
+        }
+        return .ok(consume output)
+    }
+    func rank() -> Int {
+        return self.shape_.count()
+    }
+    func dim_at_idx(_ dim: Int) -> Int {
+        return self.shape_[dim]
+    }
+    func numel() -> Int {
+        return self.values_.count()
+    }
+    func flat_value(_ idx: Int) -> f64 {
+        return self.values_[idx]
+    }
+    func flat_index(_ indices: ReadSpan<Int>) -> Result<Int, TensorError> {
+        if indices.count != self.rank() {
+            return .err(TensorError.rank_mismatch)
+        }
+        var the_point: Int = 0
+        for i in (0..<indices.count) {
+            if indices[i] < 0 || indices[i] >= self.shape_[i] {
+                return .err(TensorError.index_out_of_bounds)
+            }
+            the_point += indices[i] * self.strides_[i]
+        }
+        return .ok(the_point)
+    }
+    func value(_ indices: ReadSpan<Int>) -> Result<f64, TensorError> {
+        let findex = self.flat_index(indices)?
+        return .ok(self.values_[findex])
+    }
+    mutating func set_value(_ indices: ReadSpan<Int>, value: f64) -> Result<(), TensorError> {
+        let findex = self.flat_index(indices)?
+        self.values_[findex] = value
+        return .ok(())
+    }
+    static func from_value(_ dimensions: ReadSpan<Int>, values: ReadSpan<f64>) -> Result<Tensor, TensorError> {
+        let elem_count = shape_numel(dimensions)?
+        if elem_count != values.count {
+            return .err(TensorError.data_length_mismatch)
+        }
+        let stride_arr = shape_strides(dimensions)?
+        guard var shape = core.try_buffer<Int>(capacity: dimensions.count, allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        guard var values_real = core.try_buffer<f64>(capacity: elem_count, allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        for z in dimensions {
+            shape.append(z)
+        }
+        for i in 0..<elem_count {
+            values_real.append(values[i])
+        }
+        return .ok(Tensor(values_: consume values_real,
+            shape_: consume shape, strides_: consume stride_arr))
+    }
+    func add(_ other: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if self.rank() != other.rank() {
+            return .err(TensorError.shape_mismatch)
+        }
+        for i in 0..<self.rank() {
+            if self.dim_at_idx(i) != other.dim_at_idx(i) {
+                return .err(TensorError.shape_mismatch)
+            }
+        }
+        let out_strides = shape_strides(self.shape_.span())?
+        // lang review: better way to simplify this (e.g: map_error without closure)?
+        guard var shape = core.try_buffer<Int>(capacity: self.rank(), allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        guard var values_real = core.try_buffer<f64>(capacity: self.numel(), allocator: core.system_allocator()) else {
+            return .err(TensorError.allocation_failed)
+        }
+        // lang review: std function that turns ReadSpan into buffer
+        for z in 0..<self.rank() {
+            shape.append(self.shape_[z])
+        }
+        for z in 0..<self.numel() {
+            values_real.append(self.values_[z] + other.values_[z])
+        }
+        return .ok(Tensor(values_: consume values_real,
+            shape_: consume shape, strides_: consume out_strides))
+    }
+    func sum_all() -> Result<Tensor, TensorError> {
+        var accum: f64 = 0.0
+        for z in self.values_ {
+            accum += z
+        }
+        let scalar_shape: [Int; 0] = []
+        return Tensor.full(scalar_shape[0...], value: accum)
+    }
+    func mean_all() -> Result<Tensor, TensorError> {
+        let numel = self.numel()
+        if numel == 0 {
+            return .err(TensorError.empty_reduction)
+        }
+        var result = self.sum_all()?
+        result.values_[0] /= f64(numel)
+        return .ok(consume result)
+    }
+    func matmul(_ other: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if (self.rank() != 2) || (other.rank() != 2) {
+            return .err(TensorError.rank_mismatch)
+        }
+        let m = self.shape_[0]
+        if self.shape_[1] != other.shape_[0] {
+            return .err(TensorError.shape_mismatch)
+        }
+        let k = self.shape_[1] // its the same as other.shape_[0] because we just cheked
+        let n = other.shape_[1]
+        let new_shape = [m, n]
+        // todo/lang review: new_shape[0...] works but new_shape[...] throws an error (at least on LSP)
+        var new_tensor = Tensor.full(new_shape[0...], value: 0.0)?
+        if k == 0 || new_tensor.numel() == 0 {
+            return .ok(consume new_tensor)
+        }
+        // tl;dr we take a element A[i,p] in original matrix, and "contrubte" its effect
+        // to all the relevant elements in result matrix
+        for i in (0..<m) {
+            for p in (0..<k) {
+                let base = self.values_[i * k + p]
+                for j in (0..<n) {
+                    new_tensor.values_[i * n + j] += base * other.values_[p * n + j]
+                }
+            }
+        }
+        return .ok(consume new_tensor)
+    }
+    func relu() -> Result<Tensor, TensorError> {
+        var result = Tensor.from_value(self.shape_.span(), values: self.values_.span())?
+        for i in 0..<result.numel() {
+            if result.values_[i] <= 0.0 {
+                result.values_[i] = 0.0
+            }
+        }
+        // lang review: should we add feature to compiler that ommits need to put consume if last stmt
+        // food for thought
+        return .ok(consume result)
+    }
+    // floats might underflow in real world use cases
+    func mse_all(_ target: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if self.rank() != target.rank() {
+            return .err(.shape_mismatch)
+        }
+        // funny enough, this is first time I've ever used zip iterator despite it being in Rust (and Swift?)
+        for (left, right) in self.shape_.zip(target.shape_) {
+            if left != right {
+                return .err(.shape_mismatch) // not the same dimension
+            }
+        }
+        if self.numel() == 0 {
+            return .err(.empty_reduction)
+        }
+        var accum: f64 = 0.0
+        for (orig, new) in self.values_.zip(target.values_) {
+            let diff = orig - new // order doesn't matter because we square
+            let diff2: f64 = diff * diff
+            accum += diff2
+        }
+        accum /= f64(self.numel())
+        let scalar_shape: [Int; 0] = []
+        return Tensor.full(scalar_shape[0...], value: accum)
+    }
+    func mse_all_grad(_ target: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if self.rank() != target.rank() {
+            return .err(.shape_mismatch)
+        }
+        for (left, right) in self.shape_.zip(target.shape_) {
+            if left != right {
+                return .err(.shape_mismatch) // not the same dimension
+            }
+        }
+        if self.numel() == 0 {
+            return .err(.empty_reduction)
+        }
+        let scale = 2.0 / f64(self.numel())
+        var result = Tensor.full(self.shape_.span(), value: 0.0)?
+        for i in 0..<self.numel() {
+            result.values_[i] = (self.values_[i] - target.values_[i]) * scale
+        }
+        return .ok(consume result)
+    }
+    func softmax_rows() -> Result<Tensor, TensorError> {
+        let (rows, columns) = validate_softmax_rows(self)?
+        var output = Tensor.full(self.shape_.span(), value: 0.0)?
+        for row in 0..<rows {
+            let base = row * columns
+            var maximum = self.values_[base]
+            for col in 0..<columns {
+                if self.values_[base + col] > maximum {
+                    maximum = self.values_[base + col]
+                }
+            }
+            var total: f64 = 0.0
+            for col in 0..<columns {
+                let weight = math.exp(self.values_[base + col] - maximum)
+                output.values_[base + col] = weight
+                total += weight
+            }
+            for col in 0..<columns {
+                output.values_[base + col] /= total
+            }
+        }
+        return .ok(consume output)
+    }
+    func softmax_rows_backward(_ upstream: borrowing Tensor) -> Result<Tensor, TensorError> {
+        let (rows, columns) = validate_softmax_rows_backward(self, upstream: upstream)?
+        var output = self.softmax_rows()?
+        for row in 0..<rows {
+            let base = row * columns
+            var d: f64 = 0.0
+            for col in 0..<columns {
+                d += output.values_[base + col] * upstream.values_[base + col]
+            }
+            for col in 0..<columns {
+                output.values_[base + col] = output.values_[base + col] * (upstream.values_[base + col] - d)
+            }
+        }
+        return .ok(consume output)
+    }
+    func cross_entropy_grad(_ targets: ReadSpan<Int>) -> Result<Tensor, TensorError> {
+        let (batch, classes) = validate_classification_batch(self, targets: targets)?
+        var output = Tensor.full(self.shape_.span(), value: 0.0)?
+        for row in 0..<batch {
+            let base = row * classes
+            var max = self.values_[base]
+            for col in 0..<classes {
+                let val = self.values_[base + col]
+                if val > max {
+                    max = val
+                }
+            }
+            var s: f64 = 0.0
+            for col in 0..<classes {
+                let val = self.values_[base + col]
+                s += math.exp(val - max)
+            }
+            for col in 0..<classes {
+                let score = self.values_[base + col]
+                var gradient = math.exp(score - max) / s
+                if col == targets[row] {
+                    gradient -= 1.0
+                }
+                gradient /= f64(batch)
+                output.values_[row * classes + col] = gradient
+            }
+        }
+        return .ok(consume output)
+    }
+    func cross_entropy(_ targets: ReadSpan<Int>) -> Result<Tensor, TensorError> {
+        let (batch, classes) = validate_classification_batch(self, targets: targets)?
+        var avg_loss: f64 = 0.0
+        for row in 0..<batch {
+            let base = row * classes
+            // Validation guarantees a nonempty row. This also handles all-negative scores.
+            var max = self.values_[base]
+            for col in 0..<classes {
+                let val = self.values_[base + col]
+                if val > max {
+                    max = val
+                }
+            }
+            var s: f64 = 0.0
+            for col in 0..<classes {
+                let val = self.values_[base + col]
+                s += math.exp(val - max)
+            }
+            let corr_val = self.values_[base + targets[row]]
+            let row_loss = (max - corr_val) + math.log(s)
+            avg_loss += row_loss / f64(batch)
+        }
+        return Tensor.scalar(value: avg_loss)
+    }
+    func relu_backward(_ upstream: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if self.rank() != upstream.rank() {
+            return .err(.shape_mismatch)
+        }
+        for (left, right) in self.shape_.zip(upstream.shape_) {
+            if left != right {
+                return .err(.shape_mismatch) // not the same dimension
+            }
+        }
+        var output = Tensor.full(self.shape_.span(), value: 0.0)?
+        for i in 0..<self.numel() {
+            if self.values_[i] > 0 {
+                output.values_[i] = upstream.values_[i]
+            }
+            if self.values_[i].is_nan() {
+                output.values_[i] = self.values_[i]
+            }
+        }
+        return .ok(consume output)
+    }
+    func transpose2d() -> Result<Tensor, TensorError> {
+        if self.rank() != 2 {
+            return .err(.rank_mismatch)
+        }
+        let rows = self.shape_[0]
+        let cols = self.shape_[1]
+        let new_dimen = [cols, rows]
+        var new_tens = Tensor.full(new_dimen[0...], value: 0.0)?
+        if new_tens.numel() == 0 {
+            return .ok(consume new_tens)
+        }
+        for i in 0..<rows {
+            for k in 0..<cols {
+                new_tens.values_[k * rows + i] = self.values_[i * cols + k]
+            }
+        }
+        return .ok(consume new_tens)
+    }
+    func matmul_backward(_ other: borrowing Tensor, _ upstream: borrowing Tensor) -> Result<(Tensor, Tensor), TensorError> {
+        if self.rank() != 2 || other.rank() != 2 || upstream.rank() != 2 {
+            return .err(.rank_mismatch)
+        }
+        // [m * k] * [k * n] = [M * N]
+        if self.shape_[1] != other.shape_[0] {
+            return .err(.shape_mismatch)
+        }
+        // upstream: [m * n]
+        if upstream.shape_[0] != self.shape_[0] || upstream.shape_[1] != other.shape_[1] {
+            return .err(.shape_mismatch)
+        }
+        let b_trans = other.transpose2d()?
+        let a_trans = self.transpose2d()?
+        // backprop gradient: usptream/incoming gradient times the current grad (chain rule)
+        let a_grad = upstream.matmul(b_trans)?
+        let b_grad = a_trans.matmul(upstream)?
+        // (this comment may be wrong) a_grad is deriv of self, b_grad is deriv of other
+        return .ok((consume a_grad, consume b_grad))
+    }
+    mutating func sgd_step(_ gradient: borrowing Tensor, learning_rate: f64) -> Result<(), TensorError> {
+        if self.rank() != gradient.rank() {
+            return .err(.shape_mismatch)
+        }
+        for (i, j) in self.shape_.zip(gradient.shape_) {
+            if i != j {
+                return .err(.shape_mismatch)
+            }
+        }
+        if !core.is_finite(learning_rate) || learning_rate < 0.0 {
+            return .err(.invalid_learning_rate)
+        }
+        if learning_rate == 0 {
+            return .ok(())
+        }
+        for i in 0..<self.numel() {
+            self.values_[i] -= learning_rate * gradient.values_[i]
+        }
+        return .ok(())
+    }
+    func add_bias(_ bias: borrowing Tensor) -> Result<Tensor, TensorError> {
+        if self.rank() != 2 || bias.rank() != 1 {
+            return .err(.rank_mismatch)
+        }
+        if self.shape_[1] != bias.shape_[0] {
+            return .err(.shape_mismatch)
+        }
+        var output = Tensor.full(self.shape_.span(), value: 0.0)?
+        if output.numel() == 0 {
+            return .ok(consume output)
+        }
+        let cols = self.shape_[1]
+        for row in 0..<self.shape_[0] {
+            for col in 0..<self.shape_[1] {
+                output.values_[row * cols + col] = self.values_[row * cols + col] + bias.values_[col]
+            }
+        }
+        return .ok(consume output)
+    }
+    func sum_rows() -> Result<Tensor, TensorError> {
+        if self.rank() != 2 {
+            return .err(.rank_mismatch)
+        }
+        let carr = [self.shape_[1]] // this is the amount of columns
+        var output = Tensor.full(carr[0...], value: 0.0)?
+        if self.numel() == 0 {
+            return .ok(consume output)
+        }
+        let cols = self.shape_[1]
+        for row in 0..<self.shape_[0] {
+            for col in 0..<cols {
+                output.values_[col] += self.values_[row * cols + col]
+            }
+        }
+        return .ok(consume output)
+    }
+    func scaled(_ factor: f64) -> Result<Tensor, TensorError> {
+        var scale = Tensor.from_value(self.shape_.span(), values: self.values_.span())?
+        for i in 0..<scale.numel() {
+            scale.values_[i] *= factor
+        }
+        return .ok(consume scale)
+    }
+}
+func validate_softmax_rows(_ logits: borrowing Tensor) -> Result<(Int, Int), TensorError> {
+    if logits.rank() != 2 {
+        return .err(.rank_mismatch)
+    }
+    let rows = logits.dim_at_idx(0)
+    let columns = logits.dim_at_idx(1)
+    if columns == 0 {
+        return .err(.empty_reduction)
+    }
+    for index in 0..<logits.numel() {
+        if !core.is_finite(logits.flat_value(index)) {
+            return .err(.non_finite_logits)
+        }
+    }
+    return .ok((rows, columns))
+}
+
+func validate_softmax_rows_backward(_ logits: borrowing Tensor, upstream: borrowing Tensor) -> Result<(Int, Int), TensorError> {
+    if logits.rank() != 2 || upstream.rank() != 2 {
+        return .err(.rank_mismatch)
+    }
+    if logits.dim_at_idx(0) != upstream.dim_at_idx(0) ||
+        logits.dim_at_idx(1) != upstream.dim_at_idx(1) {
+        return .err(.shape_mismatch)
+    }
+    return validate_softmax_rows(logits)
+}
+
+
+func validate_classification_batch(_ logits: borrowing Tensor, targets: ReadSpan<Int>) -> Result<(Int, Int), TensorError> {
+    if logits.rank() != 2 {
+        return .err(.rank_mismatch)
+    }
+    let batch = logits.dim_at_idx(0)
+    let classes = logits.dim_at_idx(1)
+    if targets.count != batch {
+        return .err(.data_length_mismatch)
+    }
+    if batch == 0 || classes == 0 {
+        return .err(.empty_reduction)
+    }
+    for target in targets {
+        if target < 0 || target >= classes {
+            return .err(.index_out_of_bounds)
+        }
+    }
+    for index in 0..<logits.numel() {
+        if !core.is_finite(logits.flat_value(index)) {
+            return .err(.non_finite_logits)
+        }
+    }
+    return .ok((batch, classes))
+}
+
+struct AttentionForward {
+    let scaled_scores: Tensor
+    let probabilities: Tensor
+    let output: Tensor
+}
+
+func validate_attention_shapes(_ queries: borrowing Tensor, keys: borrowing Tensor, values: borrowing Tensor) -> Result<Int, TensorError> {
+    if queries.rank() != 2 || keys.rank() != 2 || values.rank() != 2 {
+        return .err(.rank_mismatch)
+    }
+    let key_features = queries.dim_at_idx(1)
+    if key_features != keys.dim_at_idx(1) || keys.dim_at_idx(0) != values.dim_at_idx(0) {
+        return .err(.shape_mismatch)
+    }
+    if key_features == 0 {
+        return .err(.invalid_dimension)
+    }
+    if keys.dim_at_idx(0) == 0 {
+        return .err(.empty_reduction)
+    }
+    return .ok(key_features)
+}
+
+
+func scaled_dot_product_attention(_ queries: borrowing Tensor, keys: borrowing Tensor,
+    values: borrowing Tensor) -> Result<AttentionForward, TensorError> {
+    let key_features = validate_attention_shapes(queries, keys: keys, values: values)?
+    let qk = queries.matmul(keys.transpose2d()?)?
+    let s = qk.scaled(1.0 / core.sqrt(f64(key_features)))?
+    let p = s.softmax_rows()?
+    let attn = p.matmul(values)?
+    return .ok(AttentionForward(scaled_scores: consume s,
+        probabilities: consume p, output: consume attn))
+}
+
+struct AttentionGradients {
+    let queries: Tensor
+    let keys: Tensor
+    let values: Tensor
+}
+
+func validate_attention_backward(_ queries: borrowing Tensor, keys: borrowing Tensor,
+    values: borrowing Tensor, forward: borrowing AttentionForward,
+    upstream: borrowing Tensor) -> Result<Int, TensorError> {
+    if queries.rank() != 2 || keys.rank() != 2 || values.rank() != 2 ||
+        forward.scaled_scores.rank() != 2 || forward.probabilities.rank() != 2 ||
+        forward.output.rank() != 2 || upstream.rank() != 2 {
+        return .err(.rank_mismatch)
+    }
+    let query_rows = queries.dim_at_idx(0)
+    let key_rows = keys.dim_at_idx(0)
+    let value_features = values.dim_at_idx(1)
+    if forward.scaled_scores.dim_at_idx(0) != query_rows ||
+        forward.scaled_scores.dim_at_idx(1) != key_rows ||
+        forward.probabilities.dim_at_idx(0) != query_rows ||
+        forward.probabilities.dim_at_idx(1) != key_rows ||
+        forward.output.dim_at_idx(0) != query_rows ||
+        forward.output.dim_at_idx(1) != value_features ||
+        upstream.dim_at_idx(0) != query_rows || upstream.dim_at_idx(1) != value_features {
+        return .err(.shape_mismatch)
+    }
+    let key_features = validate_attention_shapes(queries, keys: keys, values: values)?
+    _ = validate_softmax_rows(forward.scaled_scores)?
+    return .ok(key_features)
+}
+struct LinearGradients {
+    let input: Tensor
+    let weights: Tensor
+    let bias: Tensor
+}
+struct Linear {
+    // Y = XW + b (important to spec b.c sometimes people do WX)
+    private var weights_: Tensor
+    private var bias_: Tensor
+    static func from_parameters(
+        _ weights: Tensor,
+        _ bias: Tensor
+    ) -> Result<Linear, TensorError> {
+        if weights.rank() != 2 || bias.rank() != 1 {
+            return .err(.rank_mismatch)
+        }
+        // lang review: assert feature?
+        if weights.dim_at_idx(1) != bias.dim_at_idx(0) {
+            return .err(.shape_mismatch)
+        }
+        return .ok(Linear(weights_: consume weights, bias_: consume bias))
+    }
+    func forward(_ input: borrowing Tensor) -> Result<Tensor, TensorError> {
+        let output = input.matmul(self.weights_)?
+        let output2 = output.add_bias(self.bias_)?
+        return .ok(consume output2)
+    }
+    func backward(
+        _ input: borrowing Tensor,
+        _ upstream: borrowing Tensor
+    ) -> Result<LinearGradients, TensorError> {
+        let (idrv, wdrv) = input.matmul_backward(self.weights_, upstream)?
+        let biass = upstream.sum_rows()?
+        return .ok(LinearGradients(input: consume idrv, weights: consume wdrv, bias: consume biass))
+    }
+    mutating func sgd_step(
+        _ gradients: borrowing LinearGradients,
+        learning_rate: f64
+    ) -> Result<(), TensorError> {
+        if gradients.weights.rank() != 2 || gradients.bias.rank() != 1 {
+            return .err(.shape_mismatch)
+        }
+        if gradients.weights.dim_at_idx(0) != self.weights_.dim_at_idx(0) ||
+            gradients.weights.dim_at_idx(1) != self.weights_.dim_at_idx(1) ||
+            gradients.bias.dim_at_idx(0) != self.bias_.dim_at_idx(0) {
+            return .err(.shape_mismatch)
+        }
+        if !core.is_finite(learning_rate) || learning_rate < 0.0 {
+            return .err(.invalid_learning_rate)
+        }
+        self.weights_.sgd_step(gradients.weights, learning_rate: learning_rate)?
+        self.bias_.sgd_step(gradients.bias, learning_rate: learning_rate)?
+        return .ok(())
+    }
+    static func he_normal(
+        in_features: Int,
+        out_features: Int,
+        rng: inout RNG
+    ) -> Result<Linear, TensorError> {
+        if in_features <= 0 || out_features <= 0 {
+            return .err(.invalid_dimension)
+        }
+        let weight_shape = [in_features, out_features]
+        _ = shape_numel(weight_shape[0...])?
+        let bias_shape = [out_features]
+        var local_rng = rng
+        let raw_weights = Tensor.randn(weight_shape[0...], rng: &local_rng)?
+        let weights = raw_weights.scaled(core.sqrt(2.0 / f64(in_features)))?
+        let bias = Tensor.full(bias_shape[0...], value: 0.0)?
+        let layer = Linear.from_parameters(consume weights, consume bias)?
+        rng.load_state_dict(local_rng.state_dict())
+        return .ok(consume layer)
+    }
+}
+func train_step(
+    _ input: borrowing Tensor,
+    target: borrowing Tensor,
+    hidden: inout Linear,
+    output: inout Linear,
+    learning_rate: f64) -> Result<f64, TensorError> {
+    if learning_rate < 0 || !core.is_finite(learning_rate) {
+        return .err(.invalid_learning_rate)
+    }
+
+    let z = hidden.forward(input)?
+    let activ = z.relu()?
+    let pred = output.forward(activ)?
+    let loss = pred.mse_all(target)?
+    let loss_grad = pred.mse_all_grad(target)?
+    let output_gradients = output.backward(activ, loss_grad)? // Gradients for the output layer.
+    let preactiv_backprop = z.relu_backward(output_gradients.input)?
+    let hidden_backprop = hidden.backward(input, preactiv_backprop)?
+    hidden.sgd_step(hidden_backprop, learning_rate: learning_rate)?
+    output.sgd_step(output_gradients, learning_rate: learning_rate)?
+
+    return .ok(loss.flat_value(0))
+}
+func xor_demo() -> Result<Tensor, TensorError> {
+    let input_shape = [4, 2]
+    let target_shape = [4, 1]
+    let input_values = [0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]
+    let target_values = [0.0, 1.0, 1.0, 0.0]
+    let input_tens = Tensor.from_value(input_shape[0...], values: input_values[0...])?
+    let target_tens = Tensor.from_value(target_shape[0...], values: target_values[0...])?
+    var rngg = RNG.seeded(67)
+    var hiddenl = Linear.he_normal(in_features: 2, out_features: 8, rng: &rngg)?
+    var outputl = Linear.he_normal(in_features: 8, out_features: 1, rng: &rngg)?
+    for _ in 0..<2000 {
+        _ = train_step(input_tens, target: target_tens, hidden: &hiddenl, output: &outputl, learning_rate: 0.05)?
+    }
+    // Predict with the parameters after the last update.
+    let z = hiddenl.forward(input_tens)?
+    let activation = z.relu()?
+    let prediction = outputl.forward(activation)?
+    return .ok(consume prediction)
+}
+// ---- SCALAR REVERSE-MODE AUTOGRAD ----
+struct ScalarId: core.Equatable, core.Format {
+    let index: Int
+}
+enum ScalarOp: core.Equatable, core.Format {
+    case leaf
+    case add(ScalarId, ScalarId)
+    case multiply(ScalarId, ScalarId)
+    case relu(ScalarId)
+}
+struct ScalarNode {
+    let value: f64
+    // none means no gradient has reached this node; some(0) is a computed zero.
+    var grad: f64?
+    let op: ScalarOp
+}
+enum ScalarTapeError: core.Equatable, core.Format {
+    case invalid_capacity
+    case allocation_failed
+    case invalid_node
+}
+struct ScalarTape {
+    private var nodes_: core.Buffer<ScalarNode>
+
+    static func create(capacity: Int = 100) -> Result<ScalarTape, ScalarTapeError> {
+        if capacity < 0 {
+            return .err(.invalid_capacity)
+        }
+        guard let nodes = core.try_buffer<ScalarNode>(capacity: capacity, allocator: core.system_allocator()) else {
+            return .err(.allocation_failed)
+        }
+        return .ok(ScalarTape(nodes_: consume nodes))
+    }
+
+    func count() -> Int {
+        return self.nodes_.count()
+    }
+
+    private func contains(_ id: ScalarId) -> Bool {
+        return id.index >= 0 && id.index < self.nodes_.count()
+    }
+
+    func node(_ id: ScalarId) -> Result<ScalarNode, ScalarTapeError> {
+        if !self.contains(id) {
+            return .err(.invalid_node)
+        }
+        return .ok(self.nodes_[id.index])
+    }
+
+    private mutating func append(_ value: f64, op: ScalarOp) -> Result<ScalarId, ScalarTapeError> {
+        let id = ScalarId(index: self.nodes_.count())
+        let node = ScalarNode(value: value, grad: .none, op: op)
+        switch self.nodes_.try_append(node) {
+            case .ok(_):
+                return .ok(id)
+            case .err(let original):
+                drop(original)
+                return .err(.allocation_failed)
+        }
+    }
+
+    mutating func leaf(_ value: f64) -> Result<ScalarId, ScalarTapeError> {
+        return self.append(value, op: .leaf)
+    }
+
+    mutating func add(_ left: ScalarId, _ right: ScalarId) -> Result<ScalarId, ScalarTapeError> {
+        if !self.contains(left) || !self.contains(right) {
+            return .err(.invalid_node)
+        }
+        let value = self.nodes_[left.index].value + self.nodes_[right.index].value
+        return self.append(value, op: .add(left, right))
+    }
+
+    mutating func multiply(_ left: ScalarId, _ right: ScalarId) -> Result<ScalarId, ScalarTapeError> {
+        if !self.contains(left) || !self.contains(right) {
+            return .err(.invalid_node)
+        }
+        let value = self.nodes_[left.index].value * self.nodes_[right.index].value
+        return self.append(value, op: .multiply(left, right))
+    }
+
+    mutating func relu(_ input: ScalarId) -> Result<ScalarId, ScalarTapeError> {
+        if !self.contains(input) {
+            return .err(.invalid_node)
+        }
+        var value = self.nodes_[input.index].value
+        if value <= 0.0 {
+            value = 0.0
+        }
+        return self.append(value, op: .relu(input))
+    }
+
+    private mutating func accumulate_gradient(_ id: ScalarId, _ contribution: f64) {
+        if let previous = self.nodes_[id.index].grad {
+            self.nodes_[id.index].grad = .some(previous + contribution)
+        } else {
+            self.nodes_[id.index].grad = .some(contribution)
+        }
+    }
+
+    mutating func backward(_ output: ScalarId) -> Result<(), ScalarTapeError> {
+        if !self.contains(output) {
+            return .err(.invalid_node)
+        }
+        for value in inout self.nodes_ {
+            value.pointee.grad = .none
+        }
+
+        self.nodes_[output.index].grad = .some(1.0)
+        for i in (0...output.index).reversed() {
+            let curr_node = self.nodes_[i]
+            guard let gradient = curr_node.grad else {
+                continue
+            }
+            switch curr_node.op {
+                case .leaf:
+                    continue
+                case .add(let idx1, let idx2):
+                    self.accumulate_gradient(idx1, gradient)
+                    self.accumulate_gradient(idx2, gradient)
+                case .multiply(let idx1, let idx2):
+                    let a_value = self.nodes_[idx1.index].value
+                    let b_value = self.nodes_[idx2.index].value
+                    self.accumulate_gradient(idx1, gradient * b_value)
+                    self.accumulate_gradient(idx2, gradient * a_value)
+                case .relu(let idx):
+                    let a_value = self.nodes_[idx.index].value
+                    if a_value > 0.0 {
+                        self.accumulate_gradient(idx, gradient)
+                    } else if a_value.is_nan() {
+                        self.accumulate_gradient(idx, a_value)
+                    } else {
+                        self.accumulate_gradient(idx, 0.0)
+                    }
+            }
+        }
+        return .ok(())
+    }
+}
+// ---------- RANDOM (LLM GENERATED) ---------------
+// LLMs loved to place unexplained magic numbers. This has since been fixed with proper instructions for agents to ... not do this
+struct RNGState: core.Equatable, core.Format {
+    let state: u64
+    let inc: u64
+    let spare: f64?
+
+    // Checkpoints compare exactly, including a cached sample's floating-point bits.
+    func equals(_ other: borrowing RNGState) -> Bool {
+        if self.state != other.state || self.inc != other.inc {
+            return false
+        }
+        if let mine = self.spare {
+            if let theirs = other.spare {
+                return core.bit_pattern(mine) == core.bit_pattern(theirs)
+            }
+            return false
+        }
+        if case .none = other.spare {
+            return true
+        }
+        return false
+    }
+}
+
+enum RNGError: core.Equatable, core.Format {
+    case invalid_stop
+    case invalid_probabilities
+    case allocation_failed
+}
+
+// Explicit PCG32 state, an odd stream increment, and one cached Box--Muller sample.
+struct RNG {
+    private var state_: u64
+    private var inc_: u64
+    private var spare_: f64?
+
+    static func seeded(_ seed: u64 = 0, stream: u64 = 54) -> RNG {
+        var result = RNG(state_: 0, inc_: (stream << 1) | 1, spare_: .none)
+        _ = result.uint32()
+        result.state_ = result.state_ &+ seed
+        _ = result.uint32()
+        return result
+    }
+
+    mutating func uint32() -> u32 {
+        let old = self.state_
+        self.state_ = (old &* 6364136223846793005) &+ self.inc_
+        // Mask before the checked conversion: the PCG output truncates to 32 bits.
+        let mixed = u32((((old >> 18) ^ old) >> 27) & 0xFFFF_FFFF)
+        return core.rotate_right(mixed, by: Int(old >> 59))
+    }
+
+    // Exactly one draw, in [0, 1). All 32 output bits fit exactly in f64.
+    mutating func uniform() -> f64 {
+        return f64(self.uint32()) / 4294967296.0
+    }
+
+    mutating func normal() -> f64 {
+        if let value = self.spare_ {
+            self.spare_ = .none
+            return value
+        }
+        // 1 - uniform() is in (0, 1], so log cannot receive zero.
+        let radius = core.sqrt(-2.0 * math.log(1.0 - self.uniform()))
+        let angle = 6.283185307179586 * self.uniform()
+        self.spare_ = .some(radius * math.sin(angle))
+        return radius * math.cos(angle)
+    }
+
+    // Reject low draws to remove modulo bias; 2^32 itself is a valid upper bound.
+    // An invalid bound returns an error before advancing the generator.
+    mutating func randint(_ stop: Int) -> Result<Int, RNGError> {
+        if stop <= 0 || stop > 4294967296 {
+            return .err(.invalid_stop)
+        }
+        let threshold = 4294967296 % stop
+        var value = Int(self.uint32())
+        while value < threshold {
+            value = Int(self.uint32())
+        }
+        return .ok(value % stop)
+    }
+
+    // Fisher--Yates over either a fixed array's write_span or a Buffer's mutable_span.
+    // swap_at moves elements, so this also works for noncopyable element types.
+    mutating func shuffle<T>(_ values: WriteSpan<T>) -> Result<(), RNGError> {
+        if values.count > 4294967296 {
+            return .err(.invalid_stop)
+        }
+        var remaining = values.count
+        while remaining > 1 {
+            let other = self.randint(remaining)?
+            remaining -= 1
+            core.swap_at(inout values[0...], remaining, other)
+        }
+        return .ok(())
+    }
+
+    // Weights need not be normalized. Validation and summation consume no draws.
+    mutating func categorical(_ probabilities: ReadSpan<f64>) -> Result<Int, RNGError> {
+        let total = rng_probability_total(probabilities)?
+        var target = self.uniform() * total
+        var last = 0
+        for index in 0..<probabilities.count {
+            let weight = probabilities[index]
+            if weight > 0.0 {
+                last = index
+            }
+            target -= weight
+            if target < 0.0 {
+                return .ok(index)
+            }
+        }
+        // Floating rounding may leave target == 0; never fall back to a zero weight.
+        return .ok(last)
+    }
+
+    func state_dict() -> RNGState {
+        return RNGState(state: self.state_, inc: self.inc_, spare: self.spare_)
+    }
+
+    // As in ToyTorch, restore a trusted checkpoint verbatim, including the spare.
+    mutating func load_state_dict(_ state: RNGState) {
+        self.state_ = state.state
+        self.inc_ = state.inc
+        self.spare_ = state.spare
+    }
+}
+
+// Accurate summation for categorical, matching math.fsum for finite nonnegative
+// weights. Keep a compact expansion of nonoverlapping roundoff components, then
+// round once, including ties that smaller components push away from half-even.
+// The buffer normally fits in its initial 32 slots and grows only when needed.
+func rng_probability_total(_ probabilities: ReadSpan<f64>) -> Result<f64, RNGError> {
+    if probabilities.count == 0 {
+        return .err(.invalid_probabilities)
+    }
+    for index in 0..<probabilities.count {
+        let weight = probabilities[index]
+        if weight < 0.0 || !core.is_finite(weight) {
+            return .err(.invalid_probabilities)
+        }
+    }
+    let allocator = core.system_allocator()
+    guard var partials = core.try_buffer<f64>(capacity: 32, allocator: allocator) else {
+        return .err(.allocation_failed)
+    }
+    var used = 0
+    for index in 0..<probabilities.count {
+        var sum = probabilities[index]
+        var retained = 0
+        for component in 0..<used {
+            var smaller = partials[component]
+            if core.abs(sum) < core.abs(smaller) {
+                let temporary = sum
+                sum = smaller
+                smaller = temporary
+            }
+            let combined = sum + smaller
+            if !core.is_finite(combined) {
+                return .err(.invalid_probabilities)
+            }
+            let roundoff = smaller - (combined - sum)
+            if roundoff != 0.0 {
+                partials[retained] = roundoff
+                retained += 1
+            }
+            sum = combined
+        }
+        used = retained
+        if sum != 0.0 {
+            if used < partials.count() {
+                partials[used] = sum
+            } else {
+                if case .err(_) = partials.try_append(sum) {
+                    return .err(.allocation_failed)
+                }
+            }
+            used += 1
+        }
+    }
+    if used == 0 {
+        return .err(.invalid_probabilities)
+    }
+    used -= 1
+    var total = partials[used]
+    var roundoff = 0.0
+    while used > 0 {
+        used -= 1
+        let before = total
+        let component = partials[used]
+        total = before + component
+        roundoff = component - (total - before)
+        if roundoff != 0.0 {
+            break
+        }
+    }
+    if used > 0 {
+        let next = partials[used - 1]
+        if (roundoff < 0.0 && next < 0.0) || (roundoff > 0.0 && next > 0.0) {
+            let adjustment = roundoff * 2.0
+            let rounded = total + adjustment
+            if rounded - total == adjustment {
+                total = rounded
+            }
+        }
+    }
+    if total <= 0.0 || !core.is_finite(total) {
+        return .err(.invalid_probabilities)
+    }
+    return .ok(total)
+}
+
+// Stateless SplitMix64: the sample depends on position, independently of tile order.
+func indexed_uniform(_ seed: u64, _ index: u64) -> f64 {
+    var mixed = seed &+ ((index &+ 1) &* 0x9E37_79B9_7F4A_7C15)
+    mixed = (mixed ^ (mixed >> 30)) &* 0xBF58_476D_1CE4_E5B9
+    mixed = (mixed ^ (mixed >> 27)) &* 0x94D0_49BB_1331_11EB
+    mixed = mixed ^ (mixed >> 31)
+    return f64(mixed >> 11) / 9007199254740992.0
+}
+
